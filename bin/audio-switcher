@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+Audio output switcher
+
+Usage: audio-switcher [--dry-run]
+
+This script cycles through sinks listed in a user whitelist (by substring).
+It sets the default sink and moves existing sink-inputs to the new sink.
+
+Config whitelist location (priority):
+- $XDG_CONFIG_HOME/audio-switcher/order.txt
+- ~/.config/audio-switcher/order.txt
+- repo: config/order.txt
+
+Requires: `pactl`, `notify-send` (optional), Python 3
+"""
+import fcntl
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+LOCKFILE = "/tmp/audio-switcher.lock"
+REPO_ORDER = Path(__file__).resolve().parent.parent.joinpath("config", "order.txt")
+
+
+def run(cmd, capture=False):
+    if capture:
+        return subprocess.check_output(cmd, shell=True, text=True)
+    subprocess.check_call(cmd, shell=True)
+
+
+def read_whitelist():
+    # XDG aware
+    xdg = os.environ.get("XDG_CONFIG_HOME", os.path.join(os.path.expanduser("~"), ".config"))
+    paths = [Path(xdg) / "audio-switcher" / "order.txt", Path.home() / ".config" / "audio-switcher" / "order.txt", REPO_ORDER]
+    for p in paths:
+        if p.exists():
+            lines = [l.strip() for l in p.read_text().splitlines()]
+            return [l for l in lines if l and not l.startswith("#")]
+    return []
+
+
+def get_sinks():
+    out = run("pactl list short sinks", capture=True)
+    sinks = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            sid = parts[0]
+            name = parts[1]
+            sinks.append({"id": sid, "name": name})
+    return sinks
+
+
+def get_default_sink():
+    try:
+        out = run("pactl info", capture=True)
+        for line in out.splitlines():
+            if line.startswith("Default Sink:"):
+                return line.split(":", 1)[1].strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def get_sink_inputs():
+    try:
+        out = run("pactl list short sink-inputs", capture=True)
+        ids = []
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if parts:
+                ids.append(parts[0])
+        return ids
+    except subprocess.CalledProcessError:
+        return []
+
+
+def choose_next_sink(sinks, whitelist, current):
+    # Build ordered candidates by whitelist, matching substring in sink['name']
+    candidates = []
+    if whitelist:
+        for w in whitelist:
+            wlow = w.lower()
+            for s in sinks:
+                if wlow in s["name"].lower() and s["name"] not in candidates:
+                    candidates.append(s["name"])
+    # fallback to all sinks
+    if not candidates:
+        candidates = [s["name"] for s in sinks]
+
+    if not candidates:
+        return None
+
+    if current in candidates:
+        idx = candidates.index(current)
+        return candidates[(idx + 1) % len(candidates)]
+    return candidates[0]
+
+
+def notify(summary, body=""):
+    try:
+        subprocess.Popen(["notify-send", summary, body])
+    except Exception:
+        pass
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    # file lock
+    with open(LOCKFILE, "w") as lockfd:
+        try:
+            fcntl.flock(lockfd, fcntl.LOCK_EX)
+        except Exception:
+            print("Failed to acquire lock", file=sys.stderr)
+            return 1
+
+        whitelist = read_whitelist()
+        sinks = get_sinks()
+        if not sinks:
+            print("No sinks found")
+            return 1
+
+        current = get_default_sink()
+        target = choose_next_sink(sinks, whitelist, current)
+        if not target:
+            print("No target sink found")
+            return 1
+
+        print(f"Current: {current}")
+        print(f"Target : {target}")
+
+        if dry:
+            print("Dry run - not executing pactl commands")
+            return 0
+
+        try:
+            run(f"pactl set-default-sink '{target}'")
+        except subprocess.CalledProcessError as e:
+            print("Failed to set default sink:", e, file=sys.stderr)
+            return 1
+
+        # Move existing streams
+        inputs = get_sink_inputs()
+        for inp in inputs:
+            try:
+                run(f"pactl move-sink-input {inp} '{target}'")
+            except subprocess.CalledProcessError:
+                # continue moving others
+                pass
+
+        notify("Audio output", f"Switched to {target}")
+        return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

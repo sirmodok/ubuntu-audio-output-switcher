@@ -1,0 +1,10 @@
+# Whitelist order for audio-switcher
+# One substring per line. The script matches these substrings against sink names (case-insensitive)
+# Example entries matching your devices:
+FiiO
+G435
+
+# The CM106 device appears as 'alsa_output.usb-0d8c_USB_Sound_Device-00.analog-stereo'
+# add a substring that matches that sink name below:
+USB_Sound_Device
+CM106
